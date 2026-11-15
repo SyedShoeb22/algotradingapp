@@ -64,3 +64,28 @@ class AppSetting(Base):
     key = Column(String(100), unique=True, nullable=False)
     value = Column(String(500), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+from sqlalchemy import Column, Integer, String, Float, DateTime
+from datetime import datetime, timezone
+
+
+class MarketTick(Base):
+    __tablename__ = "market_ticks"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    symbol = Column(String(50), nullable=False, index=True)
+    token = Column(String(30), nullable=False)
+    exchange = Column(String(20), nullable=False)
+
+    ltp = Column(Float, nullable=False)
+
+    exchange_timestamp = Column(String(50), nullable=True)
+
+    received_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True
+    )
+
