@@ -89,3 +89,37 @@ class MarketTick(Base):
         index=True
     )
 
+
+from sqlalchemy import UniqueConstraint
+
+
+class Candle(Base):
+    __tablename__ = "candles"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "interval",
+            "candle_start",
+            name="uq_candle_symbol_interval_start"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    symbol = Column(String(50), nullable=False, index=True)
+    interval = Column(String(10), nullable=False)
+
+    candle_start = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True
+    )
+
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+
+    tick_count = Column(Integer, default=0, nullable=False)
+    volume = Column(Integer, nullable=False, default=0)

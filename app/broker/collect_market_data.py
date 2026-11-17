@@ -11,12 +11,19 @@ from app.core.database import SessionLocal
 from app.core.models import MarketTick
 
 
+# KROSS configuration
+SYMBOL = "KROSS-EQ"
+TOKEN = os.getenv("KROSS_TOKEN")
+EXCHANGE = "NSE"
+EXCHANGE_TYPE = 1  # NSE cash market
+SUBSCRIPTION_MODE = 1  # LTP
+
 tick_queue = queue.Queue()
 stop_event = threading.Event()
 
 
 def database_writer():
-    """Save incoming market ticks in batches."""
+    """Save incoming KROSS market ticks in batches."""
 
     batch = []
     last_flush = time.monotonic()
@@ -55,20 +62,34 @@ def database_writer():
                     db.add_all(records)
                     db.commit()
 
-                print(f"Saved {len(batch)} market ticks.")
+                print(f"Saved {len(batch)} KROSS market ticks.")
 
                 batch.clear()
                 last_flush = time.monotonic()
 
             except Exception as error:
-                print("Database error:", error)
-
+                print("Database error while saving ticks:", error)
                 batch.clear()
                 last_flush = time.monotonic()
 
 
 def main():
 
+    if not TOKEN:
+        raise RuntimeError(
+            "KROSS_TOKEN is missing. Add your KROSS NSE instrument "
+            "token to the .env file."
+        )
+
+    # Reset state in case main() is called again in this process.
+    stop_event.clear()
+
+    print("===================================")
+    print("KROSS LIVE MARKET-DATA COLLECTOR")
+    print("===================================")
+    print(f"Symbol: {SYMBOL}")
+    print(f"Token: {TOKEN}")
+    print(f"Exchange: {EXCHANGE}")
     print("Authenticating with Angel One...")
 
     session = connect_angel_one()
@@ -83,16 +104,20 @@ def main():
 
     token_list = [
         {
-            "exchangeType": 1,
-            "tokens": ["3045"]
+            "exchangeType": EXCHANGE_TYPE,
+            "tokens": [TOKEN]
         }
     ]
 
     def on_open(wsapp):
         print("WebSocket connected.")
-        print("Subscribing to SBIN-EQ...")
+        print(f"Subscribing to {SYMBOL}...")
 
-        ws.subscribe("sbin_collector01", 1, token_list)
+        ws.subscribe(
+            "kross_collector01",
+            SUBSCRIPTION_MODE,
+            token_list
+        )
 
     def on_data(wsapp, message):
 
@@ -101,23 +126,27 @@ def main():
         if raw_price is None:
             return
 
-        ltp = raw_price / 100
+        try:
+            ltp = float(raw_price) / 100
 
-        tick = {
-            "symbol": "SBIN-EQ",
-            "token": str(message.get("token", "3045")),
-            "exchange": "NSE",
-            "ltp": ltp,
-            "exchange_timestamp": (
-                str(message.get("exchange_timestamp"))
-                if message.get("exchange_timestamp") is not None
-                else None
-            )
-        }
+            received_tick = {
+                "symbol": SYMBOL,
+                "token": str(message.get("token", TOKEN)),
+                "exchange": EXCHANGE,
+                "ltp": ltp,
+                "exchange_timestamp": (
+                    str(message.get("exchange_timestamp"))
+                    if message.get("exchange_timestamp") is not None
+                    else None
+                )
+            }
 
-        tick_queue.put(tick)
+            tick_queue.put(received_tick)
 
-        print(f"SBIN-EQ | LTP: Rs. {ltp:.2f}")
+            print(f"{SYMBOL} | LTP: Rs. {ltp:.2f}")
+
+        except (TypeError, ValueError) as error:
+            print("Invalid market tick:", error)
 
     def on_error(wsapp, error):
         print("WebSocket error:", error)
@@ -137,7 +166,7 @@ def main():
 
     writer.start()
 
-    print("Starting market-data collector...")
+    print("Starting KROSS market-data collector...")
     print("Press CTRL+C to stop.")
 
     try:
@@ -147,12 +176,15 @@ def main():
         print("\nStopping collector...")
 
     finally:
-        ws.close_connection()
+        try:
+            ws.close_connection()
+        except Exception as error:
+            print("WebSocket shutdown message:", error)
 
         stop_event.set()
         writer.join(timeout=15)
 
-        print("Market-data collector stopped.")
+        print("KROSS market-data collector stopped.")
 
 
 if __name__ == "__main__":
