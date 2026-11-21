@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 33% 5%;
+    --foreground: 220 20% 92%;
+    --card: 224 28% 8%;
+    --card-foreground: 220 20% 92%;
+    --popover: 224 28% 8%;
+    --popover-foreground: 220 20% 92%;
+    --primary: 152 68% 45%;
+    --primary-foreground: 222 47% 6%;
+    --secondary: 223 22% 14%;
+    --secondary-foreground: 220 20% 90%;
+    --muted: 223 22% 13%;
+    --muted-foreground: 220 10% 58%;
+    --accent: 223 22% 14%;
+    --accent-foreground: 220 20% 90%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 223 20% 16%;
+    --input: 223 20% 18%;
+    --ring: 152 68% 45%;
+    --radius: 0.625rem;
+    --sidebar-background: 225 32% 6%;
+    --sidebar-foreground: 220 12% 62%;
+    --sidebar-primary: 152 68% 45%;
+    --sidebar-primary-foreground: 222 47% 6%;
+    --sidebar-accent: 223 22% 13%;
+    --sidebar-accent-foreground: 220 20% 92%;
+    --sidebar-border: 223 22% 12%;
+    --sidebar-ring: 152 68% 45%;
+
+    /* Trading semantics, derived from the terminal-green accent family */
+    --up: 152 68% 45%;
+    --down: 0 72% 55%;
+    --warn: 38 92% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    font-feature-settings: "tnum" 1, "cv05" 1;
+  }
+
+  .font-mono,
+  code,
+  kbd {
+    font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo,
+      monospace;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .text-up {
+    color: hsl(var(--up));
+  }
+
+  .text-down {
+    color: hsl(var(--down));
+  }
+
+  .text-warn {
+    color: hsl(var(--warn));
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 3px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
