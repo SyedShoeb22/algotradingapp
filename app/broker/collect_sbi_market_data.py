@@ -1,12 +1,16 @@
 
 import os
-import time
 import queue
+import signal
+import sys
 import threading
+import time
 
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 from app.broker.angel_one import connect_angel_one
+from app.broker.smartapi_compat import apply_smartapi_websocket_patch
+from app.broker.ws_lock import AngelOneWebSocketLock
 from app.core.database import SessionLocal
 from app.core.models import MarketTick
 
@@ -84,6 +88,25 @@ def main():
     # Reset state in case main() is called again in this process.
     stop_event.clear()
 
+    # Graceful SIGTERM handling
+    def _sigterm_handler(signum, frame):
+        stop_event.set()
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Apply compatibility patch for websocket-client >= 1.0
+    apply_smartapi_websocket_patch()
+
+    # Acquire shared cross-process lock BEFORE authenticating or opening connection
+    ws_lock = AngelOneWebSocketLock()
+    if not ws_lock.acquire():
+        print(
+            "[COLLECTOR] Another Angel One WebSocket collector process is currently active. "
+            "Exiting immediately to prevent HTTP 429 connection limit lockout."
+        )
+        sys.exit(75)
+
     print("===================================")
     print("SBI LIVE MARKET-DATA COLLECTOR")
     print("===================================")
@@ -109,17 +132,20 @@ def main():
         }
     ]
 
-    def on_open(wsapp):
+    def on_open(wsapp, *args, **kwargs):
         print("WebSocket connected.")
         print(f"Subscribing to {SYMBOL}...")
 
         ws.subscribe(
-            "kross_collector01",
+            "sbi_collector01",
             SUBSCRIPTION_MODE,
             token_list
         )
 
-    def on_data(wsapp, message):
+    def on_data(wsapp, message, *args, **kwargs):
+
+        if not isinstance(message, dict):
+            return
 
         raw_price = message.get("last_traded_price")
 
@@ -148,11 +174,15 @@ def main():
         except (TypeError, ValueError) as error:
             print("Invalid market tick:", error)
 
-    def on_error(wsapp, error):
-        print("WebSocket error:", error)
+    def on_error(wsapp_or_msg, error=None, *args, **kwargs):
+        err_text = str(error) if error is not None else str(wsapp_or_msg)
+        print("WebSocket error:", err_text)
 
-    def on_close(wsapp):
-        print("WebSocket connection closed.")
+    def on_close(wsapp, *args, **kwargs):
+        code = args[0] if len(args) > 0 else kwargs.get("close_status_code")
+        reason = args[1] if len(args) > 1 else kwargs.get("close_reason")
+        info = f" (code: {code}, reason: {reason})" if (code or reason) else ""
+        print(f"WebSocket connection closed{info}.")
 
     ws.on_open = on_open
     ws.on_data = on_data
@@ -183,6 +213,13 @@ def main():
 
         stop_event.set()
         writer.join(timeout=15)
+        if writer.is_alive():
+            print(
+                "[COLLECTOR] CRITICAL: Writer thread did not terminate within timeout; "
+                "retaining Angel One lock for safety."
+            )
+        else:
+            ws_lock.release()
 
         print("SBI market-data collector stopped.")
 

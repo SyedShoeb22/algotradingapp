@@ -21,6 +21,10 @@ INTERVAL = "5min"
 
 POLL_SECONDS = 15
 RESTART_DELAY_SECONDS = 5
+MAX_COLLECTOR_RETRIES = 5           # Max consecutive failures before halting collector restarts
+BASE_RESTART_DELAY_SECONDS = 5     # Base backoff delay
+MAX_RESTART_DELAY_SECONDS = 60     # Cap on exponential backoff
+STABLE_RUN_SECONDS = 60            # Seconds of stable running to reset failure counter
 
 COLLECTOR_MODULE = "app.broker.collect_sbi_market_data"
 CANDLE_MODULE = "app.backtesting.sbi_candle_builder"
@@ -156,8 +160,23 @@ def stop_collector(process):
 # --------------------------------------------------
 
 def main():
+    import signal
+
+    shutdown_requested = False
+
+    def handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        print(f"\n[RUNNER] Received signal {signum}. Initiating graceful shutdown...")
+        shutdown_requested = True
+
+    # Handle both Ctrl+C (SIGINT) and systemd stop (SIGTERM)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
     collector = None
+    collector_started_at = None
+    consecutive_failures = 0
+    collector_halted = False
 
     # Restore last processed candle from SQLite
     last_processed_candle = get_last_processed_candle_key()
@@ -173,30 +192,79 @@ def main():
     print("=" * 55)
 
     try:
+        while not shutdown_requested:
+            # Start or restart collector with controlled retry policy & circuit breaker
+            if not collector_halted:
+                if collector is None or collector.poll() is not None:
+                    if collector is not None:
+                        exit_code = collector.returncode
+                        uptime = (
+                            time.monotonic() - collector_started_at
+                            if collector_started_at
+                            else 0
+                        )
+                        print(
+                            f"[RUNNER] Collector exited (code: {exit_code}, uptime: {uptime:.1f}s)"
+                        )
 
-        while True:
+                        if exit_code == 75:
+                            collector_halted = True
+                            print(
+                                "\n[RUNNER] Collector aborted: another Angel One WebSocket process holds the lock."
+                            )
+                            print(
+                                "[RUNNER] Halting collector restarts to prevent broker connection limit (HTTP 429) conflict."
+                            )
+                            continue
 
-            # Start or restart collector
-            if collector is None or collector.poll() is not None:
+                        # If collector ran stably, reset consecutive failures
+                        if uptime >= STABLE_RUN_SECONDS:
+                            consecutive_failures = 0
 
-                if collector is not None:
-                    print(
-                        "[RUNNER] Collector exited. "
-                        f"Exit code: {collector.returncode}"
-                    )
-                    time.sleep(RESTART_DELAY_SECONDS)
+                        consecutive_failures += 1
 
-                collector = start_collector()
+                        if consecutive_failures >= MAX_COLLECTOR_RETRIES:
+                            collector_halted = True
+                            print(
+                                f"\n[RUNNER] CIRCUIT BREAKER TRIPPED: Collector failed "
+                                f"{consecutive_failures} consecutive times."
+                            )
+                            print(
+                                "[RUNNER] Halting collector restarts to prevent broker "
+                                "connection limit (HTTP 429) exhaustion."
+                            )
+                            print(
+                                "[RUNNER] Manual investigation required. Check logs and credentials."
+                            )
+                        else:
+                            # Capped exponential backoff: 5s, 10s, 20s, 40s, 60s
+                            backoff_delay = min(
+                                MAX_RESTART_DELAY_SECONDS,
+                                BASE_RESTART_DELAY_SECONDS * (2 ** (consecutive_failures - 1)),
+                            )
+                            print(
+                                f"[RUNNER] Waiting {backoff_delay}s before restart attempt "
+                                f"{consecutive_failures + 1}/{MAX_COLLECTOR_RETRIES}..."
+                            )
+                            for _ in range(int(backoff_delay)):
+                                if shutdown_requested:
+                                    break
+                                time.sleep(1)
+
+                    if not collector_halted and not shutdown_requested:
+                        collector = start_collector()
+                        collector_started_at = time.monotonic()
+
+            if shutdown_requested:
+                break
 
             # Generate completed candles
             builder_status = run_module(CANDLE_MODULE)
 
             if builder_status == 0:
-
                 latest_key = get_latest_candle_key()
 
                 if latest_key and latest_key != last_processed_candle:
-
                     print(
                         "\n[RUNNER] New completed candle detected:",
                         latest_key
@@ -205,21 +273,16 @@ def main():
                     paper_status = run_module(PAPER_MODULE)
 
                     if paper_status == 0:
-
                         # Read the actual database record.
                         # The paper engine may reject a duplicate candle.
                         last_processed_candle = (
                             get_last_processed_candle_key()
                         )
-
                 else:
-
                     print(
                         "[RUNNER] No new completed 5-minute candle."
                     )
-
             else:
-
                 print(
                     "[RUNNER] Candle builder failed. "
                     "Paper engine will not run this cycle."
@@ -229,16 +292,17 @@ def main():
                 f"\n[RUNNER] Next check in {POLL_SECONDS} seconds..."
             )
 
-            time.sleep(POLL_SECONDS)
+            # Interruptible poll sleep
+            for _ in range(POLL_SECONDS):
+                if shutdown_requested:
+                    break
+                time.sleep(1)
 
     except KeyboardInterrupt:
-
         print("\n[RUNNER] Shutdown requested.")
 
     finally:
-
         stop_collector(collector)
-
         print("[RUNNER] Continuous paper trading stopped.")
         print("[RUNNER] Real order execution was never enabled.")
 

@@ -1,10 +1,14 @@
 
+import os
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
 
 from app.core.database import BASE_DIR
+
+load_dotenv()
 
 # --------------------------------------------------
 # SBI PAPER-TRADING CONFIGURATION
@@ -18,11 +22,18 @@ MAX_POSITION_VALUE = 20000.0
 SYMBOL = "SBIN-EQ"
 INTERVAL = "5min"
 EXCHANGE = "NSE"
+TOKEN = os.getenv("SBI_TOKEN")
 
 IST = ZoneInfo("Asia/Kolkata")
 
 # Maximum permitted age of the last completed candle.
 MAX_CANDLE_AGE_MINUTES = 10
+
+# Maximum permitted age of a live market tick for trade execution (seconds)
+MAX_TICK_STALE_SECONDS = 5
+
+# AAOIFI Shariah Screening: Must remain empty until documented screening is complete
+AAOIFI_APPROVED_SYMBOLS = frozenset()
 
 STRATEGY_NAME = "EMA20_EMA50_RSI14_MACD"
 
@@ -94,7 +105,7 @@ def initialize_account(conn):
 
 
 # --------------------------------------------------
-# MARKET DATA
+# MARKET DATA & FRESHNESS VALIDATION
 # --------------------------------------------------
 
 def get_latest_candle():
@@ -127,6 +138,67 @@ def normalize_datetime(value):
         value = value.astimezone(timezone.utc).replace(tzinfo=None)
 
     return value
+
+
+def get_latest_fresh_live_tick(
+    conn,
+    symbol: str,
+    token: str | None = None,
+    exchange: str = "NSE",
+    max_age_seconds: int = MAX_TICK_STALE_SECONDS,
+):
+    """Retrieve and validate the most recent live tick from market_ticks.
+
+    Guarantees:
+    - Exact symbol, token, and exchange match
+    - Positive valid LTP (> 0)
+    - Freshness: received_at within max_age_seconds of now_utc
+    - Genuinely live provenance (rejects simulated/demo prefix or missing token)
+    """
+    resolved_token = token if token is not None else TOKEN
+    if not resolved_token or str(resolved_token).startswith("SIM-"):
+        return None, f"Invalid, simulated, or missing instrument token for {symbol}"
+
+    row = conn.execute("""
+        SELECT ltp, token, exchange, received_at, exchange_timestamp
+        FROM market_ticks
+        WHERE symbol = ?
+          AND token = ?
+          AND exchange = ?
+          AND ltp > 0
+        ORDER BY received_at DESC
+        LIMIT 1
+    """, (symbol, str(resolved_token), exchange)).fetchone()
+
+    if not row:
+        return None, f"No live market ticks found for {symbol} (token={resolved_token}, exchange={exchange})"
+
+    ltp = float(row["ltp"])
+    if ltp <= 0:
+        return None, f"Invalid tick LTP ({ltp}) for {symbol}"
+
+    received_at_str = row["received_at"]
+    try:
+        clean_str = str(received_at_str).replace("Z", "+00:00")
+        tick_time = datetime.fromisoformat(clean_str)
+        if tick_time.tzinfo is not None:
+            tick_time = tick_time.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None, f"Unparseable tick timestamp: {received_at_str}"
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    age_seconds = (now_utc - tick_time).total_seconds()
+
+    if age_seconds < 0:
+        age_seconds = 0
+
+    if age_seconds > max_age_seconds:
+        return None, (
+            f"Market tick for {symbol} is stale ({age_seconds:.1f}s old > {max_age_seconds}s limit). "
+            f"Live feed may be disconnected."
+        )
+
+    return {"ltp": ltp, "received_at": tick_time, "age_seconds": age_seconds}, "Fresh live tick verified"
 
 
 def validate_candle(candle):
@@ -198,64 +270,47 @@ def get_signal(expected_candle_start):
 
     latest = df.iloc[-1]
 
-    required = [
-        "ema_20",
-        "ema_50",
-        "rsi_14",
-        "macd",
-        "macd_signal"
-    ]
+    expected = normalize_datetime(expected_candle_start)
+    latest_candle = normalize_datetime(latest["candle_start"])
 
-    if latest[required].isna().any():
-        return "HOLD", "Indicators are not ready."
+    if latest_candle != expected:
+        return "HOLD", (
+            f"Indicator candle mismatch. "
+            f"Expected {expected}, got {latest_candle}"
+        )
 
-    # Ensure the indicator calculation uses the same candle
-    # that passed the freshness check.
-    indicator_candle_start = normalize_datetime(
-        latest["candle_start"]
-    )
+    ema20 = latest["ema20"]
+    ema50 = latest["ema50"]
+    rsi = latest["rsi"]
+    macd = latest["macd"]
+    signal = latest["macd_signal"]
 
-    expected_candle_start = normalize_datetime(
-        expected_candle_start
-    )
+    if any(v is None for v in [ema20, ema50, rsi, macd, signal]):
+        return "HOLD", "Indicators are incomplete."
 
-    if indicator_candle_start != expected_candle_start:
-        return "HOLD", "Indicator candle does not match latest candle."
+    if ema20 > ema50 and rsi > 55 and macd > signal:
+        return "BUY", "Bullish alignment across EMA, RSI, MACD"
 
-    if (
-        latest["ema_20"] > latest["ema_50"]
-        and 50 < latest["rsi_14"] < 70
-        and latest["macd"] > latest["macd_signal"]
-    ):
-        return "BUY", "Bullish EMA, RSI and MACD conditions."
+    if ema20 < ema50 and rsi < 45 and macd < signal:
+        return "SELL", "Bearish alignment across EMA, RSI, MACD"
 
-    if (
-        latest["ema_20"] < latest["ema_50"]
-        and 30 < latest["rsi_14"] < 50
-        and latest["macd"] < latest["macd_signal"]
-    ):
-        return "SELL", "Bearish EMA, RSI and MACD conditions."
-
-    return "HOLD", "No complete trading signal."
+    return "HOLD", "No trade setup"
 
 
 # --------------------------------------------------
-# PAPER POSITION
+# POSITION LOOKUP
 # --------------------------------------------------
 
 def get_open_position(conn):
 
     row = conn.execute("""
-        SELECT
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN side = 'BUY' THEN quantity
-                        WHEN side = 'SELL' THEN -quantity
-                        ELSE 0
-                    END
-                ), 0
-            ) AS quantity
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN side = 'BUY' THEN quantity
+                WHEN side = 'SELL' THEN -quantity
+                ELSE 0
+            END
+        ), 0) AS quantity
         FROM paper_trades
         WHERE symbol = ?
           AND status = 'EXECUTED'
@@ -273,14 +328,32 @@ def execute_paper_trade(signal, price, candle_start):
     if signal not in ("BUY", "SELL", "HOLD"):
         raise ValueError(f"Invalid signal: {signal}")
 
-    if price <= 0:
-        print("Invalid execution price.")
+    if signal == "HOLD":
+        print("Signal is HOLD. No trade executed.")
+        return
+
+    # Shariah Compliance Gate
+    if signal == "BUY" and SYMBOL not in AAOIFI_APPROVED_SYMBOLS:
+        print(f"[REJECTED] BUY blocked: {SYMBOL} is not verified in AAOIFI_APPROVED_SYMBOLS.")
         return
 
     conn = get_connection()
 
     try:
         initialize_account(conn)
+
+        # Re-verify live tick freshness inside transaction scope
+        tick_data, tick_msg = get_latest_fresh_live_tick(
+            conn, SYMBOL, TOKEN, EXCHANGE, max_age_seconds=MAX_TICK_STALE_SECONDS
+        )
+        if not tick_data:
+            print(f"[REJECTED] Paper trade aborted: {tick_msg}")
+            return
+
+        exec_price = round(float(tick_data["ltp"]), 2)
+        if exec_price <= 0:
+            print("Invalid execution price from live tick.")
+            return
 
         # Acquire a write lock before checking whether this candle
         # has already been processed.
@@ -330,14 +403,14 @@ def execute_paper_trade(signal, price, candle_start):
         if signal == "BUY" and position == 0:
 
             quantity = int(
-                min(MAX_POSITION_VALUE, account["cash"]) // price
+                min(MAX_POSITION_VALUE, account["cash"]) // exec_price
             )
 
             if quantity <= 0:
                 print("Insufficient virtual cash.")
 
             else:
-                value = quantity * price
+                value = quantity * exec_price
 
                 conn.execute("""
                     INSERT INTO paper_trades
@@ -347,7 +420,7 @@ def execute_paper_trade(signal, price, candle_start):
                 """, (
                     SYMBOL,
                     quantity,
-                    price,
+                    exec_price,
                     value,
                     datetime.now(timezone.utc).isoformat()
                 ))
@@ -360,12 +433,12 @@ def execute_paper_trade(signal, price, candle_start):
 
                 print(
                     f"PAPER BUY: {quantity} shares "
-                    f"at Rs. {price:.2f}"
+                    f"at Rs. {exec_price:.2f}"
                 )
 
         elif signal == "SELL" and position > 0:
 
-            value = position * price
+            value = position * exec_price
 
             conn.execute("""
                 INSERT INTO paper_trades
@@ -375,7 +448,7 @@ def execute_paper_trade(signal, price, candle_start):
             """, (
                 SYMBOL,
                 position,
-                price,
+                exec_price,
                 value,
                 datetime.now(timezone.utc).isoformat()
             ))
@@ -388,7 +461,7 @@ def execute_paper_trade(signal, price, candle_start):
 
             print(
                 f"PAPER SELL: {position} shares "
-                f"at Rs. {price:.2f}"
+                f"at Rs. {exec_price:.2f}"
             )
 
         else:
@@ -473,20 +546,50 @@ def main():
         return
 
     candle_start = candle["candle_start"]
-    price = float(candle["close"])
 
     signal, reason = get_signal(candle_start)
 
     print(f"Symbol: {SYMBOL}")
     print(f"Interval: {INTERVAL}")
     print(f"Latest completed candle: {candle_start}")
-    print(f"Price: Rs. {price:.2f}")
     print(f"Signal: {signal}")
     print(f"Reason: {reason}")
 
+    if signal == "HOLD":
+        print("Signal is HOLD. No trade executed.")
+        show_account_summary()
+        return
+
+    # Shariah Compliance Gate
+    if signal == "BUY" and SYMBOL not in AAOIFI_APPROVED_SYMBOLS:
+        print(
+            f"Paper trading skipped: BUY blocked: AAOIFI Shariah screening "
+            f"is not verified for {SYMBOL}."
+        )
+        return
+
+    # Live Feed Freshness Gate
+    conn = get_connection()
+    try:
+        tick_data, tick_msg = get_latest_fresh_live_tick(
+            conn, SYMBOL, TOKEN, EXCHANGE, max_age_seconds=MAX_TICK_STALE_SECONDS
+        )
+    finally:
+        conn.close()
+
+    if not tick_data:
+        print(f"Paper trading skipped: {tick_msg}")
+        return
+
+    exec_price = round(float(tick_data["ltp"]), 2)
+    print(
+        f"Validated LIVE Execution Price: Rs. {exec_price:.2f} "
+        f"(tick age: {tick_data['age_seconds']:.1f}s)"
+    )
+
     execute_paper_trade(
         signal,
-        price,
+        exec_price,
         candle_start
     )
 
@@ -495,4 +598,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
